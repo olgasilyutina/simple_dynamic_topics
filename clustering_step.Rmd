@@ -1,0 +1,163 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(jsonlite)
+library(stringr)
+library(tidyr)
+library(dplyr)
+library(widyr)
+library(ggplot2)
+library(data.table)
+library(readr)
+library(psych)
+library(ggraph)
+#library(stm)
+library(tm)
+library(igraph)
+library(lubridate)
+library(tidytext)
+```
+
+```{r}
+set.seed(1)
+setwd("~/Downloads/migrants_data")
+# беру файлы со словосочетаниями, которые записывали в последнем чанке юпитер ноутбука, их названия начинаются на migration_terms_*, поэтмоу на строчке 29 указываю, что нужны все файлы, которые начинаются с этих символов
+filenames <- list.files(path="~/Downloads/migrants_data",
+    pattern="migration_terms_*")
+full_data <- data.frame(
+  cat=character(),
+                term=character(),
+                 count=numeric(),
+                 stringsAsFactors=FALSE) 
+for (fl in filenames){  
+  Sys.setlocale(locale = "Russian")
+  dt_gath = read.csv(paste('~/Downloads/migrants_data/', fl, sep=''), encoding = "utf8")
+  print(colnames(dt_gath))
+  dt <- dt_gath %>% dplyr::select(cat, term, count)
+  full_data = rbind(full_data, dt)
+}
+
+full_data = full_data[!duplicated(full_data), ]
+full_data_num = full_data %>% group_by(cat) %>% summarize(num_words = n_distinct(term))
+sum(full_data_num$num_words)
+full_data <- full_data %>% bind_tf_idf(term, cat, count)
+only_terms = full_data['term']
+only_terms = only_terms[!duplicated(only_terms), ]
+quantile(full_data$tf_idf)
+tfidf = full_data$tf_idf
+```
+
+❗ Константа **минимальное значение tf-idf**
+Если нужно больше слов, можем брать такде слова с маленькой выраженностью и не ограничивать по tf-idf
+```{r}
+min_tfidf = tfidf[tfidf < 0.0001279375]
+```
+
+### Кластеризация словосочетаний по каждому году
+```{r}
+dfs <- data.frame(membership=character(),
+                 term=character(),
+                 count=numeric(),
+                 stringsAsFactors=FALSE) 
+filenames
+for (fl in filenames){  
+  dt_gath = read_csv(paste('~/Downloads/migrants_data/', fl, sep=''))
+  med_drug <- dt_gath %>% dplyr::select(id, cat, term, count)
+  full_data =  dplyr::select(full_data, cat, term, tf_idf)
+  med_drug <- left_join(med_drug, full_data, by=c('cat', 'term'))
+  med_drug <- med_drug %>% dplyr::select(id, term, tf_idf) %>% filter(tf_idf > min_tfidf)
+  med_drug <- as.data.frame(med_drug)
+  pc <- graph_from_data_frame(med_drug, directed = F) 
+  V(pc)$type <- FALSE
+  V(pc)$type[V(pc)$name %in% med_drug[, 1]] <- TRUE
+  one_mode_networks <- bipartite_projection(pc)
+  sgdf.copy <- one_mode_networks$proj1
+  set.seed(1)
+  fastgreedy_main <- cluster_louvain(sgdf.copy)
+  table_fastgreedy_main <- cbind(fastgreedy_main$membership, fastgreedy_main$names)
+  table_fastgreedy_main = as.data.frame(table_fastgreedy_main)
+  table_fastgreedy_main$V1 = as.character(table_fastgreedy_main$V1)
+  table_fastgreedy_main$V2 = as.character(table_fastgreedy_main$V2)
+  colnames(table_fastgreedy_main)[1] <- "membership"
+  colnames(table_fastgreedy_main)[2] <- "term"
+  table_fastgreedy_main$membership <- paste(table_fastgreedy_main$membership, '_', fl, sep='')
+  head(table_fastgreedy_main, 1)
+  dfs = rbind(dfs, table_fastgreedy_main)
+}
+dfs$cat <- as.numeric(gsub("(.*?_nd_ic2s2_)(\\d+)(\\.csv)", "\\2", dfs$membership))
+fin_df = left_join(dfs, select(full_data, cat, term, tf_idf), by=c('cat', 'term'))
+fin_df$cluster =  gsub("(.*)(_nd_)(.*?)(.csv)", "\\1", fin_df$membership)
+fin_df$cluster = paste(fin_df$cat, fin_df$cluster, sep="_")
+words_by_cluster = fin_df %>% group_by(fin_df$memb) %>% count()
+write.csv(words_by_cluster, '~/Downloads/migrants_data/words_by_cluster_migration.csv', row.names=F)
+wbc = read_csv('~/Downloads/migrants_data/words_by_cluster_migration.csv')
+
+# сохраняем финальный датасет с кластерами словосочетаний в нашу папку migrants_data, это главный файл для интерпретации кластеров, мотрим на словосочетания, которые вошли в каждый из кластеров
+con<-file('~/Downloads/migrants_data/final_migration.csv')
+write.csv(fin_df,file=con, row.names = F)
+```
+
+```{r}
+min_char_count = 9
+fin_sum = fin_df %>% group_by(cat) %>% summarize(sum_tfinf = sum(tf_idf))
+fin_df = left_join(fin_df, fin_sum, by='cat')
+fin_df$norm_tfidf = fin_df$tf_idf/fin_df$sum_tfinf
+
+max_term = fin_df %>% filter(nchar(term) > min_char_count) %>% group_by(cluster) %>%
+  slice(which.max(norm_tfidf)) %>% mutate(memb = paste(term, cluster, sep = "_")) %>% select(cluster, memb)
+fin_df = left_join(fin_df, max_term, by='cluster')
+library(reshape2)
+w <- dcast(fin_df, memb~term, value.var='norm_tfidf')
+w = w[!is.na(w$memb),]
+samp2 <- w[,-1]
+rownames(samp2) <- w[,1]
+samp2[is.na(samp2)] <- 0
+
+
+# здесь происходит сравнение кластеров словосочетаний по косинуснуму расстоянию и преобразование данных в формат для построения сети 
+# код не очень понятный, но должен работать, так что достаточно просто прогнать
+library(wordspace)
+library(Matrix)
+samp2 = as.matrix(samp2)
+A <- as(samp2, "sparseMatrix")       
+B <- Matrix(samp2, sparse = TRUE)  
+samp2_dsm = dsm(A)
+dm = dist.matrix(samp2_dsm, method="cosine", convert=FALSE)
+dm[ row(dm) == col(dm) ] <- NA
+dm_df = as.data.frame(dm)
+dm_df = dm_df %>% 
+  tibble::rownames_to_column('id') %>%  # creates an ID number
+  gather(dept, cnt, colnames(dm_df)[1]:colnames(dm_df)[length(colnames(dm_df))]) %>% 
+  group_by(id) %>% 
+  slice(which.max(cnt))  =
+dm_df = dm_df[!duplicated(data.frame(t(apply(dm_df[1:2], 1, sort)), dm_df$cnt)),]
+dm_df[is.na(dm_df)] <- 0
+nodes = data.frame(dm_df$id)
+nodes$node = c(0:(nrow(nodes)-1))
+colnames(nodes)[1] = 'name'
+links = as.data.frame(dm_df)
+names(links) = c("source", "target", "value")
+colnames(nodes)[1] = 'source'
+links = left_join(links, nodes, by='source')
+links = links %>% select(-source)
+colnames(links)[3] = 'source'
+colnames(nodes)[1] = 'target'
+links = left_join(links, nodes, by='target')
+links = links %>% select(-target)
+colnames(links)[3] = 'target'
+links = na.omit(links)
+colnames(nodes)[1] = 'name'
+links = links %>% arrange(source)
+links = links[!duplicated(data.frame(t(apply(links[2:3], 1, sort)), links$value)),]
+links = group_by(links, value) %>% slice(1)
+links = links[!duplicated(links[,1]),]
+links_values = links %>% select(value)
+
+# сохраняем файлы с нодами кластеров и связями между ними, кластеры связаны (файл links), когда они похожи
+write.csv(links, "~/Downloads/migrants_data/links_migration.csv", row.names = F)
+write.csv(nodes, "~/Downloads/migrants_data/nodes_migration.csv", row.names = F)
+```
+
